@@ -10,3 +10,13 @@ MEMORY {
     /* Define the memory region for SRAM */
     RAM   : ORIGIN = 0x20000000, LENGTH = 264K
 }
+
+/* This is required for the bare metal and PAC bootloader */
+SECTIONS {
+  /* ### Boot loader */
+  .boot_loader ORIGIN(BOOT2) :
+  {
+    KEEP(*(.boot_loader*));
+  } > BOOT2
+
+} INSERT BEFORE .text;

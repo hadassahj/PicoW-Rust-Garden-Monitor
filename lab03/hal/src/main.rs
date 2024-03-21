@@ -1,9 +1,22 @@
 #![no_std]
 #![no_main]
 
+// use core::arch::asm;
+// use core::cell::Cell;
 use core::panic::PanicInfo;
+// use core::ptr::{read_volatile, write_volatile};
+// use critical_section::Mutex;
 
 use cortex_m_rt::entry;
+// use cortex_m_rt::{exception, ExceptionFrame};
+// use rp2040_hal::gpio::bank0::{Gpio0, Gpio12, Gpio1};
+// use rp2040_pac::{interrupt, Peripherals};
+
+// use rp2040_hal::gpio::{
+//     FunctionSioInput, FunctionSioOutput, Pin, Pins, PullUp, Interrupt
+// };
+// use rp2040_hal::Sio;
+// use embedded_hal::digital::{OutputPin, StatefulOutputPin};
 
 // TODO 1 - add the RP2040 bootloader
 

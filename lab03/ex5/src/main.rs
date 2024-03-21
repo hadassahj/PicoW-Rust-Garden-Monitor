@@ -5,6 +5,14 @@ use core::panic::PanicInfo;
 
 use embassy_executor::Spawner;
 
+// use embassy_rp::{
+//     gpio::{self, Input, Pull},
+//     peripherals::{PIN_12, PIN_25},
+// };
+
+// use embassy_time::Timer;
+// use gpio::{Level, Output};
+
 // TODO 6 - register a new task that receives the LED and button pins as parameters
 //        - loop to wait for the button press and toggle the LED
 

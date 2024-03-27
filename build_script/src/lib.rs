@@ -22,7 +22,12 @@ pub fn memory_layout() {
         .write_all(include_bytes!("../../memory.x"))
         .unwrap();
     println!("cargo:rustc-link-search={}", out.display());
-    println!("cargo:rerun-if-changed={{layout}}");
+
+    // By default, Cargo will re-run a build script whenever
+    // any file in the project changes. By specifying `memory.x`
+    // here, we ensure the build script is only re-run when
+    // `memory.x` is changed.
+    println!("cargo:rerun-if-changed=../../memory.x");
 
     // `--nmagic` is required if memory section addresses are not aligned to 0x10000,
     // for example the FLASH and RAM sections in your `memory.x`.
@@ -35,7 +40,4 @@ pub fn memory_layout() {
     // The `link-rp.x` linker script provided by `embassy_rp` that defines the
     // BOOT2 section.
     println!("cargo:rustc-link-arg-bins=-Tlink-rp.x");
-
-    // The `defmt.x` linker script provided by `defmt`.
-    println!("cargo:rustc-link-arg-bins=-Tdefmt.x");
 }

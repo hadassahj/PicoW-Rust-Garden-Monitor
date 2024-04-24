@@ -1,5 +1,5 @@
 [package]
-name = "lab07_all"
+name = "lab08_ex3_4"
 authors.workspace = true
 version.workspace = true
 rust-version.workspace = true
@@ -32,6 +32,6 @@ embedded-graphics = "0.7.1"
 st7789 = "0.6.1"
 display-interface = "0.4.1"
 byte-slice-cast = { version = "1.2.0", default-features = false }
-embedded-hal = { package = "embedded-hal", version = "1.0.0" }
+embedded-hal-1 = { package = "embedded-hal", version = "1.0.0" }
 embedded-hal-async = "1.0.0-rc.2"
 embedded-hal-bus = { version = "0.1.0-rc.2", features = ["async"] }

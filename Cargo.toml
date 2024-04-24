@@ -21,8 +21,11 @@ members = [
     "lab06/lab06_ex2",
     "lab06/lab06_ex3_4",
     "lab06/lab06_ex5", 
-    "lab07/lab07_all",
-]
+    "lab07/lab07_all", 
+    "lab08/lab08_ex1_2", 
+    "lab08/lab08_ex3_4", 
+    "lab08/lab08_ex5"
+    , "lab08/lab08_ex6"]
 exclude = ["build_script"]
 # The resolver is a component responsible for determining the versions of 
 # dependencies that should be used to build a Rust project.

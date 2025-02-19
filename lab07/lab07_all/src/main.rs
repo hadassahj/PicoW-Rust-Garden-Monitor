@@ -4,54 +4,38 @@
 
 use core::panic::PanicInfo;
 use embassy_executor::Spawner;
-
-use embassy_rp::gpio::{Input, Level, Output, Pin, Pull};
-
-// USB driver
-use embassy_rp::usb::{Driver, InterruptHandler as USBInterruptHandler};
+//gpio
+use embassy_rp::gpio::{Input, Output, Level, Pin, Pull};
+use embassy_rp::pwm::{Config as PwmConfig, Pwm};
+//usb driver
+use embassy_rp::usb::{Driver, Endpoint, InterruptHandler as USBInterruptHandler};
 use embassy_rp::{bind_interrupts, peripherals::USB};
 use log::info;
-
-use embassy_time::Timer;
-
+use embassy_time::{Timer, Duration};
 // I2C
 use embassy_rp::i2c::{Config as I2cConfig, I2c, InterruptHandler as I2CInterruptHandler};
 use embassy_rp::peripherals::I2C0;
-use embedded_hal_async::i2c::{Error, I2c as _};
+use embassy_rp::peripherals::I2C1;
+use embedded_hal_async::i2c::I2c as _;
+use embassy_rp::adc::{Adc, Channel, Config as AdcConfig, InterruptHandler as AdcInterruptHandler};
+//wifi 
+use core::str::from_utf8;
 
-use core::cell::RefCell;
-use embassy_embedded_hal::shared_bus::blocking::spi::SpiDeviceWithConfig;
-use embassy_rp::spi;
-use embassy_rp::spi::{Async, Blocking, Spi};
-use embassy_sync::blocking_mutex::raw::NoopRawMutex;
-use embassy_sync::blocking_mutex::Mutex;
+use byte_slice_cast::AsByteSlice;
+use cyw43_pio::PioSpi;
+use embassy_futures::select::select;
+use embassy_net::tcp::TcpSocket;
+use embassy_net::udp::{PacketMetadata, UdpSocket};
+use embassy_net::{Config, IpAddress, IpEndpoint, Ipv4Address, Ipv4Cidr, Stack, StackResources};
+use embassy_rp::peripherals::{DMA_CH0, PIO0};
+use embassy_rp::pio::{InterruptHandler, Pio};
+use embedded_io_async::Write;
+use heapless::Vec;
+use log::{ warn};
+use static_cell::StaticCell;
 
-use core::fmt::Write;
-use embassy_time::Delay;
-use embedded_graphics::mono_font::iso_8859_16::FONT_10X20;
-use embedded_graphics::mono_font::MonoTextStyle;
-use embedded_graphics::pixelcolor::Rgb565;
-use embedded_graphics::prelude::*;
-use embedded_graphics::text::renderer::CharacterStyle;
-use embedded_graphics::text::Text;
-use heapless::String;
-use lab07_all::SPIDeviceInterface;
-use st7789::{Orientation, ST7789};
 
-bind_interrupts!(struct Irqs {
-    // Use for the serial over USB driver
-    USBCTRL_IRQ => USBInterruptHandler<USB>;
-    I2C0_IRQ => I2CInterruptHandler<I2C0>;
-});
 
-const DISPLAY_FREQ: u32 = 64_000_000;
-
-#[embassy_executor::task]
-async fn logger_task(driver: Driver<'static, USB>) {
-    embassy_usb_logger::run!(1024, log::LevelFilter::Info, driver);
-}
-
-// The formula for calculating the actual temperature value (in Celsius) from the raw value
 fn calculate_temperature(temperature_raw: u32) -> i32 {
     let var1: i32 = ((temperature_raw as i32 >> 3) - (27504 << 1)) * (26435 >> 11);
     let var2: i32 = ((temperature_raw as i32 >> 4) - 27504)
@@ -60,130 +44,367 @@ fn calculate_temperature(temperature_raw: u32) -> i32 {
     ((var1 + var2) * 5 + 128) >> 8
 }
 
+bind_interrupts!(struct Irqs {
+    USBCTRL_IRQ => USBInterruptHandler<USB>;
+    ADC_IRQ_FIFO => AdcInterruptHandler;
+    I2C0_IRQ => I2CInterruptHandler<I2C0>;
+    I2C1_IRQ => I2CInterruptHandler<I2C1>;
+    PIO0_IRQ_0 => InterruptHandler<PIO0>;
+});
+
+const WIFI_NETWORK: &str = "hdsiph";
+const WIFI_PASSWORD: &str = "12345678";
+
+
+#[embassy_executor::task]
+async fn logger_task(driver: Driver<'static, USB>) {
+    embassy_usb_logger::run!(1024, log::LevelFilter::Info, driver);
+}
+
+#[embassy_executor::task]
+async fn wifi_task(runner: cyw43::Runner<'static, Output<'static>, PioSpi<'static, PIO0, 0, DMA_CH0>>) -> ! {
+    runner.run().await
+}
+
+#[embassy_executor::task]
+async fn net_task(stack: &'static Stack<cyw43::NetDriver<'static>>) -> ! {
+    stack.run().await
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let peripherals = embassy_rp::init(Default::default());
 
-    // Start the serial port over USB driver
     let driver = Driver::new(peripherals.USB, Irqs);
     spawner.spawn(logger_task(driver)).unwrap();
 
-    let mut display_config = spi::Config::default();
-    display_config.frequency = DISPLAY_FREQ;
-    display_config.phase = spi::Phase::CaptureOnSecondTransition;
-    display_config.polarity = spi::Polarity::IdleHigh;
 
-    // Display SPI pins
-    let miso = peripherals.PIN_4;
-    let mosi = peripherals.PIN_19;
-    let clk = peripherals.PIN_18;
+    // LED rosu
+    let mut ledr = Output::new(peripherals.PIN_8, Level::Low);
+    
 
-    // Display SPI
-    let mut spi_display: Spi<'_, _, Blocking> =
-        Spi::new_blocking(peripherals.SPI0, clk, mosi, miso, display_config.clone());
-    // SPI bus for display
-    let spi_bus: Mutex<NoopRawMutex, _> = Mutex::new(RefCell::new(spi_display));
+    // LED verde1
+    let mut ledv1 = Output::new(peripherals.PIN_7, Level::Low);
 
-    let mut display_cs = Output::new(peripherals.PIN_17, Level::High);
+    // LED verde2
+    let mut ledv2 = Output::new(peripherals.PIN_4, Level::Low);
+   
 
-    // Display SPI device initialization
-    let display_spi = SpiDeviceWithConfig::new(&spi_bus, display_cs, display_config);
+    // LED galben
+    let mut ledg = Output::new(peripherals.PIN_5, Level::Low);
+    
 
-    // Other display pins
-    let rst = peripherals.PIN_0;
-    let dc = peripherals.PIN_16;
-    let dc = Output::new(dc, Level::Low);
-    let rst = Output::new(rst, Level::Low);
-    let di = SPIDeviceInterface::new(display_spi, dc);
+    //BUZZER
+    let mut buzzer = Output::new(peripherals.PIN_1, Level::Low);
+    // let mut config_pwm: PwmConfig = Default::default();
+    // config_pwm.top=0xFFFF;
+    // config_pwm.compare_a=0;
+    // let mut pwm_buzzer=Pwm::new_output_b(peripherals.PWM_SLICE0, peripherals.PIN_1, config_pwm.clone());
+    
+    
+    // SENZOR TEMPERATURA
+    let sda = peripherals.PIN_20;
+    let scl = peripherals.PIN_21; 
+ 
+    let mut i2c = I2c::new_async(&peripherals.I2C0, scl, sda, Irqs, I2cConfig::default());
 
-    // Init ST7789 LCD
-    let mut display = ST7789::new(di, rst, 240, 240);
-    display.init(&mut Delay).unwrap();
-    display.set_orientation(Orientation::Portrait).unwrap();
-    display.clear(Rgb565::BLACK).unwrap();
+    const BMP280_ADDR: u16 = 0x76;
+ 
+    const REG_ADDR_ID: u8 = 0xD0;
+    const REG_ADDR_CTRL_MEAS: u8 = 0xF4;
+    const REG_ADDR_PRESS_MSB: u8 = 0xF7;
+    const REG_ADDR_TEMP_MSB: u8 = 0xFA;
+ 
+    let tx_buf = [REG_ADDR_ID]; 
+    let mut rx_buf = [0x00u8];
+ 
+    i2c.write_read(BMP280_ADDR, &tx_buf, &mut rx_buf).await.unwrap(); 
+    let register_value = rx_buf[0];
 
-    // Define style
-    let mut style = MonoTextStyle::new(&FONT_10X20, Rgb565::GREEN);
-    style.set_background_color(Some(Rgb565::BLACK));
+    // SENZOR LUMINOZITATE
+    let mut adc = Adc::new(peripherals.ADC, Irqs, AdcConfig::default());
+    let mut luminosity_sensor = Channel::new_pin(peripherals.PIN_27, Pull::None);
 
-    // EXERCISE 2 --------------------
-    // TODO 1: Declare SDA and SCL pins
+    // SENZOR UMIDITATE SOL
+    // Define ADC
+    let mut soil_moist_sensor = Channel::new_pin(peripherals.PIN_26, Pull::None);
 
-    // TODO 2: Define async I2C
+    // POMPA APA
+    let mut pompa = Output::new(peripherals.PIN_0, Level::Low);
 
-    // TODO 3: Define I2C address of the BMP280 (from lab or from datasheet)
-    const BMP280_ADDR: u16 = 0x00;
+    
 
-    // TODO 4: Define ID register address (from last lab or from datasheet)
-    const REG_ADDR_ID: u8 = 0x00;
-    // EXERCISE 3 --------------------
-    // TODO 9: Define CTRL_MEAS register address
-    const REG_ADDR_CTRL_MEAS: u8 = 0x00;
+    // constante pentru planta folosita: dracena
+    const TEMP_MIN: i32 = 18;
+    const TEMP_MAX: i32 = 24;
+    const LUM_MIN: u16 = 1638;
+    const LUM_MAX: u16 = 2457;
+    const UMID_MIN: u16 = 2718;
+    const UMID_MAX: u16 = 3177;
 
-    // TODO 12: Define PRESS register address
-    const REG_ADDR_PRESS_MSB: u8 = 0x00;
 
-    // TODO 17: Define TEMP register address
-    const REG_ADDR_TEMP_MSB: u8 = 0x00;
 
-    // TODO 5: Define TX buffer that will be sent to the sensor
-    //         This should be initialized with one element: the address of the register we want to read
+///////////////////////////////////////////////////////////
+//  // Link CYW43 firmware
+//  let fw = include_bytes!("../../../cyw43-firmware/43439A0.bin");
+//  let clm = include_bytes!("../../../cyw43-firmware/43439A0_clm.bin");
 
-    // TODO 6: Define RX buffer that will store the value received from the sensor
-    //         This can be initially set to a buffer with one empty value (0)
-    //         This will store the value of the register we read from the sensor
+//  // Init SPI for communication with CYW43
+//  let pwr = Output::new(peripherals.PIN_23, Level::Low);
+//  let cs = Output::new(peripherals.PIN_25, Level::High);
+//  let mut pio = Pio::new(peripherals.PIO0, Irqs);
+//  let spi = PioSpi::new(
+//      &mut pio.common,
+//      pio.sm0,
+//      pio.irq0,
+//      cs,
+//      peripherals.PIN_24,
+//      peripherals.PIN_29,
+//      peripherals.DMA_CH0,
+//  );
 
-    // TODO 7: Write the TX buffer and read to the RX buffer
-    //         You can use the `write_read_async` function here, and provide it with the I2C address of the BMP280
+//  // Start Wi-Fi task
+//  static STATE: StaticCell<cyw43::State> = StaticCell::new();
+//  let state = STATE.init(cyw43::State::new());
+//  let (net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw).await;
+//  spawner.spawn(wifi_task(runner)).unwrap();
 
-    // TODO 8: Get the value of the ID register from the RX buffer
-    // END EXERCISE 2 ------------------
-    let id = 0;
+//  // Init the device
+//  control.init(clm).await;
+//  control
+//      .set_power_management(cyw43::PowerManagementMode::PowerSave)
+//      .await;
 
+//  let config = Config::dhcpv4(Default::default());
+
+//  // Generate random seed
+//  let seed = 0x0123_4567_89ab_cdef;
+
+//  // Init network stack
+//  static STACK: StaticCell<Stack<cyw43::NetDriver<'static>>> = StaticCell::new();
+//  static RESOURCES: StaticCell<StackResources<2>> = StaticCell::new();
+//  let stack = &*STACK.init(Stack::new(
+//      net_device,
+//      config,
+//      RESOURCES.init(StackResources::<2>::new()),
+//      seed,
+//  ));
+
+//  // Start network stack task
+//  spawner.spawn(net_task(stack)).unwrap();
+
+//  loop {
+//     // Join WPA2 access point
+//     match control.join_wpa2(WIFI_NETWORK, WIFI_PASSWORD).await {
+//         Ok(_) => break,
+//         Err(err) => {
+//             info!("join failed with status {}", err.status);
+//         }
+//     }
+// }
+
+// // Wait for DHCP
+// info!("waiting for DHCP...");
+// while !stack.is_config_up() {
+//     Timer::after_millis(100).await;
+// }
+// info!("DHCP is now up {:?}!", stack.config_v4());
+
+// // Create buffers for UDP
+// let mut rx_buffer = [0; 4096];
+// let mut rx_metadata_buffer = [PacketMetadata::EMPTY; 3];
+// let mut tx_buffer = [0; 4096];
+// let mut tx_metadata_buffer = [PacketMetadata::EMPTY; 3];
+
+// let mut buf = [0u8; 4096];
+
+// loop {
+//     let mut socket = UdpSocket::new(
+//         stack,
+//         &mut rx_metadata_buffer,
+//         &mut rx_buffer,
+//         &mut tx_metadata_buffer,
+//         &mut tx_buffer,
+//     );
+
+//     info!("Starting server on UDP:1234...");
+
+//     // Bind socket to port
+//     if let Err(e) = socket.bind(1234) {
+//         warn!("accept error: {:?}", e);
+//         continue;
+//     }
+
+//     control.gpio_set(0, true).await; // this is necessary!
+
+//     let mut button = Input::new(peripherals.PIN_15, Pull::Up);
+///////////////////////////////////////////////////
     loop {
-        Timer::after_millis(1000).await;
-        info!("ID of BMP280: {id}");
-        // TODO 10: Define TX buffer for configuring the sensor (for writing to the `ctrl_meas` register)
-        //          The contents of the buffer are similar to what we used in the last lab with SPI
 
-        // TODO 11: Write this buffer to the sensor (`write`)
 
-        // TODO 13: Define TX and RX buffers for reading pressure registers
-        //          Hint: The RX buffer should have 3 elements, since we want to
-        //                read press_msb, press_lsb and press_xlsb
 
-        // TODO 14: Read the three pressure register values from the sensor (just like you did with the `id`)
+            
+        //senzor luminozitate
+        let luminozitate = adc.read(&mut luminosity_sensor).await.unwrap();
+        info!("-------------------------------------");
+        info!("Luminosity: {}", luminozitate);
+        Timer::after_secs(1).await;
+        if luminozitate < LUM_MIN {
+            info!("LUMINOSITY IS BELOW MINIMUM! HELP THE PLANT!");
+        } else if luminozitate > LUM_MAX {
+            info!("LUMINOSITY IS ABOVE MAXIMUM! GIVE THE PLANT SOME SUNGLASSES AND SUNSCREEN!");
+        }
+        else {
+            info!("Good job, the plant is happily lit!");
+        }
 
-        // TODO 15: Compute the raw pressure value from the three register values
-        let pressure_raw: u32 = 0; // modify
 
-        // TODO 16: Print the raw pressure value
+        //senzor umiditate sol
+        let level = adc.read(&mut soil_moist_sensor).await.unwrap();
+        info!("-------------------------------------");
+        info!("Soil moisture: {}", level);
+        Timer::after_secs(1).await;
+        if level > UMID_MIN {
+            info!("SOIL MOISTURE IS BELOW MINIMUM! WATER THE PLANT!");
+        } else if level < UMID_MAX{
+            info!("SOIL MOISTURE IS ABOVE MAXIMUM! deWATER THE PLANT!");
+        }else {
+            info!("Good job, the plant is better hydrated than yor skin!");
+        }
 
-        info!("Raw pressure reading: {pressure_raw}");
 
-        // TODO 18: Define TX and RX buffers for reading temperature registers
 
-        // TODO 19: Read the three temperature register values from the sensor
+        // senzor temperatura si presiune
+        let tx_buf = [REG_ADDR_CTRL_MEAS,  0b001_001_11];    
 
-        // TODO 20: Compute the raw temperature value from the three register values
+        i2c.write(BMP280_ADDR, &tx_buf).await.unwrap();
+        let tx_buf_press = [REG_ADDR_PRESS_MSB];
+        let mut rx_buf_press = [0x00u8; 3];
 
-        let temperature_raw: u32 = 0; // modify
+        i2c.write_read(BMP280_ADDR, &tx_buf_press, &mut rx_buf_press).await.unwrap();
 
-        // TODO 21: Get the actual temperature value (in Celsius), using the provided `calculate_temperature`
-        //          function
-        let temperature: i32 = 0; // modify
+        let press_msb = rx_buf_press[0] as u32;
+        let press_lsb = rx_buf_press[1] as u32;
+        let press_xlsb = rx_buf_press[2] as u32;
 
-        // TODO 22: Print the actual temperature value
+        let pressure_raw = (press_msb << 12) + (press_lsb << 4) + (press_xlsb >> 4);
+        info!("-------------------------------------");
+        info!("Raw pressure: {pressure_raw}");
 
-        info!("Temperature reading (Celsius): {temperature}");
+        let tx_buf_temp = [REG_ADDR_TEMP_MSB];
+        let mut rx_buf_temp = [0x00u8; 3];
 
-        // END EXERCISE 3 -------------------------
+        i2c.write_read(BMP280_ADDR, &tx_buf_temp, &mut rx_buf_temp).await.unwrap();
+        let temp_msb = rx_buf_temp[0] as u32;
+        let temp_lsb = rx_buf_temp[1] as u32;
+        let temp_xlsb = rx_buf_temp[2] as u32;
 
-        // EXERCISE 4
-        // TODO 23: Print the raw pressure and the actual temperature to the screen
-        //          Hint: The temperature value returned by the `calculate_temperature` function is 100 * temperature
-        //                Print the correct value to the screen, as a rational number (example: 24.50 degrees)
-    }
+        let temperature_raw = (temp_msb << 12) + (temp_lsb << 4) + (temp_xlsb >> 4);// modify
+
+        let temperature = calculate_temperature(temperature_raw as u32);
+        let real_temp=temperature/100;
+        let real_temp_dec=temperature%100;
+        info!("Temperature: {}.{}",
+        real_temp, real_temp_dec);
+
+        if real_temp < TEMP_MIN {
+            info!("TEMPERATURE IS BELOW MINIMUM! TURN ON THE RADIATOR!");
+        } else if real_temp > TEMP_MAX {
+            info!("TEMPERATURE IS ABOVE MAXIMUM! TURN ON THE AC!");
+        }
+        else {
+            info!("Good job, the plant is in a cozy environment!");
+        }
+
+
+
+        // if uri
+        if real_temp < TEMP_MIN || real_temp > TEMP_MAX {
+            ledg.set_high();
+            ledv2.set_low();
+        } else {
+            ledg.set_low();
+            ledv2.set_high();
+        }
+
+
+        if luminozitate < LUM_MIN || luminozitate > LUM_MAX {
+            ledv1.set_low();
+            ledr.set_high();
+        } else {
+            ledv1.set_high();
+            ledr.set_low();
+        }
+
+
+        if level < UMID_MIN   {
+            buzzer.set_high();
+            // config_pwm.compare_a=config_pwm.top/2;
+            pompa.set_low();
+            Timer::after_secs(1).await;
+            buzzer.set_low();
+        } else if level > UMID_MAX{
+            pompa.set_high();
+            buzzer.set_high();
+            // config_pwm.compare_a=config_pwm.top/2;
+            Timer::after_secs(1).await;
+            buzzer.set_low();
+        } else {
+            buzzer.set_low();
+            // config_pwm.compare_a=0;
+            pompa.set_low();
+        }
+
+        // pwm_buzzer.set_config(&config_pwm);
+        info!("");
+        info!("");
+        Timer::after_secs(4).await;
+
+
+////////////////////////////////////////////////////
+
+        // let select_result = select(
+        //     button.wait_for_falling_edge(),
+        //     socket.recv_from(&mut buf),
+        // ).await;
+
+        // match select_result {
+        //     embassy_futures::select::Either::First(_) => {
+        //         info!("Button pressed, sending message.");
+        //         let msg = "Button pressed";
+        //         let endpoint = IpEndpoint::new(IpAddress::v4(172, 20, 10, 10), 1234);
+        //         if let Err(e) = socket.send_to(msg.as_bytes(), endpoint).await {
+        //             warn!("Send error: {:?}", e);
+        //         }
+        //     }
+        //     embassy_futures::select::Either::Second(recv) => {
+        //         match recv {
+        //             Ok((n, endpoint)) => {
+        //                 let received_message = from_utf8(&buf[..n]).unwrap().trim();
+        //                 info!("Received '{}' from {:?}", received_message, endpoint);
+
+        //                 match received_message {
+        //                     "ON" => {
+        //                         control.gpio_set(0, true).await; // turn on LED
+        //                     },
+        //                     "OFF" => {
+        //                         control.gpio_set(0, false).await; // turn off LED
+        //                     },
+        //                     _ => {
+        //                         warn!("Unknown command: '{}'", received_message);
+        //                     }
+        //                 }
+        //             },
+        //             Err(e) => {
+        //                 warn!("Recv error: {:?}", e);
+        //             }
+        //         }
+        //     },
+        // }
+      
+    //}
+      ///////////////////////////////////////////////////////////
+}
 }
 
 #[panic_handler]
